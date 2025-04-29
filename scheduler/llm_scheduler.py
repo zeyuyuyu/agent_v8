@@ -1,4 +1,4 @@
-import json, textwrap, requests, fitz
+import json, textwrap, requests, fitz, uuid                    # ← uuid 用来生成 subtask_id
 from typing import List, Dict, Tuple, Any, Callable, Optional
 from openai import OpenAI
 from mcp.memory import MemoryStore
@@ -11,6 +11,8 @@ REGISTRY: Dict[str, Dict[str, str]] = {
                        "desc": "长篇文本解析、逻辑推理"},
     "llama2_agent_2": {"url": "http://142.214.185.187:30934/infer",
                        "desc": "OCR、表格/图像抽取"},
+    "web_build_agent": {"url": "http://http://54.179.24.46:5000/infer",
+                       "desc": "可以用来构建网页，输入prompt给这个agent，返回一个URL。这个URL就是生成的网页的地址"},
 }
 
 def _page_ranges(ids: List[str]) -> List[Tuple[str, str]]:
@@ -29,14 +31,18 @@ class LLMScheduler:
     @staticmethod
     def _pdf_pages(data): return [(f"page_{i+1}",p.get_text("text"))
                                   for i,p in enumerate(fitz.open(stream=data,filetype="pdf"))]
-    def _call_agent(self,ag,prompt):
-        try:
-            r=requests.post(REGISTRY[ag]["url"],json={"prompt":prompt},timeout=180)
-            res=r.json() if r.status_code==200 else {}
-            return ("succeed",res.get("result","")) if "result" in res else ("failed",str(res)[:120])
-        except Exception as e: return "failed",f"[❌]{e}"
 
-    # ---------- GPT 规划 ----------
+    def _call_agent(self, ag: str, payload: Dict[str,Any]):
+        """MCP：始终发送 JSON，其中至少包含 subtask_id 与 prompt"""
+        try:
+            r = requests.post(REGISTRY[ag]["url"], json=payload, timeout=180)
+            res = r.json() if r.status_code == 200 else {}
+            return ("succeed", res.get("result", "")) if "result" in res \
+                   else ("failed", str(res)[:120])
+        except Exception as e:
+            return "failed", f"[❌]{e}"
+
+    # ---------- GPT 规划 ----------（保持原样） ---------------------------
     def _plan_pdf(self,task,pages):
         summary_lines=[]
         for pid,txt in pages:
@@ -72,10 +78,15 @@ class LLMScheduler:
         except: data={}
         return {k:v for k,v in data.items() if k in REGISTRY and isinstance(v,list)}
 
-    # ---------- dispatch ----------
-    def dispatch(self,ctx,task,pdf_bytes=None,progress_cb:Callable[[Dict[str,Any]],None]|None=None):
-        self._push(progress_cb,{"type":"chat_text","data":{"message":"已接收任务，开始规划…"}})
+    # ---------- dispatch ---------- ---------------------------------------
+    def dispatch(self,ctx,task,*,pdf_bytes=None,
+                 progress_cb:Callable[[Dict[str,Any]],None]|None=None):
+
+        self._push(progress_cb,{"type":"chat_text",
+                                "data":{"message":"已接收任务，开始规划…"}})
+
         subtasks=[]; page_dict={}
+
         # ---- PDF ----
         if pdf_bytes:
             pages=self._pdf_pages(pdf_bytes); page_dict=dict(pages)
@@ -87,40 +98,71 @@ class LLMScheduler:
             idx=1
             for ag,ids in plan.items():
                 for p1,p2 in _page_ranges(ids):
-                    desc="Process "+(p1 if p1==p2 else f"{p1}~{p2}")
-                    subtasks.append({"index":idx,"description":desc,"agent":ag,"pages":(p1,p2)}); idx+=1
+                    subtasks.append({
+                        "index": idx,
+                        "subtask_id": uuid.uuid4().hex,          # ← 唯一 subtask_id
+                        "description": "Process "+(p1 if p1==p2 else f"{p1}~{p2}"),
+                        "agent": ag,
+                        "pages": (p1,p2)
+                    })
+                    idx+=1
         # ---- TEXT ----
         else:
             if not self._need_split(task):
-                subtasks=[{"index":1,"description":task,"agent":next(iter(REGISTRY))}]
+                subtasks=[{
+                    "index": 1,
+                    "subtask_id": uuid.uuid4().hex,
+                    "description": task,
+                    "agent": next(iter(REGISTRY))
+                }]
             else:
                 plan=self._plan_text(task); idx=1
                 for ag,lst in plan.items():
                     for s in lst:
-                        subtasks.append({"index":idx,"description":s,"agent":ag}); idx+=1
+                        subtasks.append({
+                            "index": idx,
+                            "subtask_id": uuid.uuid4().hex,
+                            "description": s,
+                            "agent": ag
+                        }); idx+=1
 
         self._push(progress_cb,{"type":"subtask_list",
                                 "data":{"list":[{"index":s["index"],
-                                                 "description":s["description"]} for s in subtasks]}})
+                                                 "description":s["description"]}
+                                                 for s in subtasks]}})
+
         # ---- execute subtasks ----
         for st in subtasks:
             self._push(progress_cb,{"type":"subtask_start","data":st})
             self._push(progress_cb,{"type":"action_start",
-                                    "data":{"subtask_index":st["index"],"index":1,
-                                            "agent_name":st["agent"],"description":st["description"]}})
+                                    "data":{"subtask_index":st["index"],
+                                            "index":1,
+                                            "agent_name":st["agent"],
+                                            "description":st["description"]}})
+
             if pdf_bytes:
                 p1,p2=st["pages"]
                 s=int(p1.split("_")[1]); e=int(p2.split("_")[1])
-                prompt="【任务】"+task+"\n\n" + "\n\n".join(page_dict[f"page_{i}"] for i in range(s,e+1))
+                prompt="【任务】"+task+"\n\n" + "\n\n".join(
+                    page_dict[f"page_{i}"] for i in range(s,e+1))
             else:
                 prompt="【任务】"+task+"\n\n【子任务】"+st["description"]
-            status,result=self._call_agent(st["agent"],prompt)
+
+            # 发送符合 MCP 的载荷：带 subtask_id
+            payload = {"subtask_id": st["subtask_id"], "prompt": prompt}
+
+            status,result=self._call_agent(st["agent"], payload)
+
             self._push(progress_cb,{"type":"action_end",
-                                    "data":{"subtask_index":st["index"],"index":1,
-                                            "agent_name":st["agent"],"status":status,
-                                            "result_format":"markdown","result":result}})
-            self._push(progress_cb,{"type":"subtask_end","data":{"index":st["index"]}})
+                                    "data":{"subtask_index":st["index"],
+                                            "index":1,
+                                            "agent_name":st["agent"],
+                                            "status":status,
+                                            "result_format":"markdown",
+                                            "result":result}})
+            self._push(progress_cb,{"type":"subtask_end",
+                                    "data":{"index":st["index"]}})
 
         self._push(progress_cb,{"type":"chat_file",
-                                "data":{"format":"markdown","file_data":"# 任务完成 ✅"}})
-
+                                "data":{"format":"markdown",
+                                        "file_data":"# 任务全部完成 ✅"}})
