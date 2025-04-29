@@ -12,7 +12,7 @@ REGISTRY: Dict[str, Dict[str, str]] = {
     "llama2_agent_2": {"url": "http://142.214.185.187:30934/infer",
                        "desc": "OCR、表格/图像抽取"},
     "web_build_agent": {"url": "http://http://54.179.24.46:5000/infer",
-                       "desc": "可以用来构建网页，输入prompt给这个agent，返回一个URL。这个URL就是生成的网页的地址"},
+                       "desc": "可以用来构建网页，输入prompt给这个agent，返回一个URL。这个URL就是生成的网页的地址"}
 }
 
 def _page_ranges(ids: List[str]) -> List[Tuple[str, str]]:
